@@ -1,0 +1,154 @@
+Name:
+Generate_XALD_List Version 1.2 06/17/2023
+
+Description:
+List of samples needing second tier XALD test generated when script is executed
+
+Usage:
+1. In Result Viewer, export NeoBase2 grid to Plates folder before accepting plate
+2. Once all of the plates have been exported and accepted, double click Generate_XALD_List.ps1
+3. A new CSV will be generated in the Output folder with all samples needing a second tier test and
+all of the processed CSV files in the Plates folder will be moved to archive folder
+4. Open newly generated CSV file in the output folder and copy & paste into ABN log
+
+
+Notes:
+1. I have included a lot of comments in the PowerShell code to help with
+understanding/troubleshooting, but it can be removed
+2. Main folder should always contain an Output folder, Plates folder(containing Archive folder), 
+Generate_XALD_List.ps1, Create_XALD_List.bat, and optionally the README text file
+3. An optional Archive folder can be added to the Output folder for storage of old generated
+second tier XALD lists
+4. Repeat plates can be processed with this script as well, but must be exported as samples only
+5. File Names cannot be changed
+6. General folder can be stored on shared network drive, but must be ran on on local computer
+since script uses local paths
+
+Updates:
+6-17-23
+1. Updated code to no longer save over output files with the same name
+2. Updated code to exclude Dietary monitoring samples
+3. Updated code to exclude bad injections (Samples with All Flags value of Prevented)
+
+
+
+PowerShell code:
+
+#set the archive, input, and output folder paths relative to the script location
+$inputFolder = Join-Path -Path $PSScriptRoot -ChildPath "Plates"
+$outputFolder = Join-Path -Path $PSScriptRoot -ChildPath "Output"
+$archiveFolder = Join-Path -Path $inputFolder -ChildPath "Archive"
+
+#Get all csv files that contain the exported grids from each accepted plate in the input folder
+$csvFiles = Get-ChildItem -Path $inputFolder -Filter "*.csv"
+
+#the following code counts # of csv files in input folder and throws an error if there are zero
+if ($csvFiles.Count -eq 0) {
+    Write-Host "No CSV files found in the input folder. Ensure there are CSV files in the folder."
+    Write-Host "Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    exit
+}
+
+#Empty array called selectedData to store samples to be retested
+$selectedData = @()
+
+#Iterate through each csv file in the input folder
+foreach ($file in $csvFiles) {
+    #Could not figure out how to only import relevant columns so Header warning is silenced here
+    $df = Import-Csv -Path $file.FullName -WarningAction 'SilentlyContinue' |
+        Where-Object { $_.CodeStr -notmatch '^\d{6}-\d$' -and $_.'All Flags' -ne 'Prevented' } |
+        Select-Object "CodeStr", "C26:0-LPC"
+
+    # Exclude any DM samples
+    $df = $df | Where-Object {
+        $codeStr = $_.CodeStr -replace '^="(\d+)"$', '$1'
+        $lastFourNumbers = $codeStr -replace '^.*(\d{4})$', '$1'
+        $lastFourNumbers -notmatch '^(400[1-9]|40[1-9]\d)$' } |
+        Select-Object "CodeStr", "C26:0-LPC"
+
+    #Sorted by descending C26 values 
+    $sortedData = $df | Sort-Object -Property 'C26:0-LPC' -Descending
+    
+    #The following determines what the minimum number of samples to select from each plate will be
+    #minSamples is initially set as the number of samples greater than or equal to 0.55 (with the -ge comparison operator)
+    #With the same comparison operator the code checks to see if the top 3% samples is a higher number
+    #whichever is higher is set as the minimum number of samples to retest from the specific plate
+    $minSamples = ($sortedData | Where-Object { $_.'C26:0-LPC' -ge 0.55 }).Count
+    if ([Math]::Ceiling($sortedData.Count * 0.03) -ge $minSamples) {
+        $minSamples = [Math]::Ceiling($sortedData.Count * 0.03)
+    }
+
+    #select the determined minimum number of samples that need a second tier XALD test from $sortedData
+    #only the sample number and C26 value are selected from the row
+    #the extracted data is then appended to the selectedData array while changing sample value format to be integer
+    $selectedData += $sortedData | Select-Object -First $minSamples -Property @{
+        Name = "CodeStr"
+        Expression = { $_.CodeStr -replace '^="(\d+)"$', '$1' }
+    }, "C26:0-LPC"
+    $selectedRows = $sortedData | Select-Object -First $minSamples -Property "CodeStr", "C26:0-LPC"
+    $sortedData = $sortedData | Select-Object -Skip $minSamples -Property "CodeStr", "C26:0-LPC"
+
+    #Check to see if there is multiple of the same values to avoid discrimanting against samples
+    $extraSamples = 0
+    for ($x = 0; $x -lt $sortedData.Count; $x++) {
+        $nextValue = $sortedData[$x].'C26:0-LPC'
+        $currentValue = $selectedRows | Measure-Object -Property 'C26:0-LPC' -Minimum |Select-Object -ExpandProperty Minimum
+        
+        if ($nextValue -eq $currentValue) {
+            $extraSamples += 1
+        }
+    }
+
+    #Append second tier samples from plate and change samples number format to integer
+    $selectedData += $sortedData | Select-Object -First $extraSamples -Property @{
+        Name = "CodeStr"
+        Expression = { $_.CodeStr -replace '^="(\d+)"$', '$1' }
+    }, "C26:0-LPC"
+
+    #move the processed plate csvs to the archive folder and check if there is already a file with the same name
+    $archivePath = Join-Path -Path $archiveFolder -ChildPath $file.Name
+    try {
+        Move-Item -Path $file.FullName -Destination $archivePath -ErrorAction Stop
+    } catch {
+        if ($_.Exception.GetType().FullName -eq 'System.IO.IOException') {
+            Write-Host "A file with the name '$($file.Name)' already exists in the archive folder."
+            # Handle the error as needed
+        } else {
+            throw $_.Exception
+        }
+    }
+}
+
+#for convenience the following sorts the selected samples in ascending order by accession number (useful for pasting into ABN log)
+$selectedData = $selectedData | Sort-Object -Property 'CodeStr'
+
+#output CSV file path created with the date being included in the csv file name
+#I have liked including the time in the file name as it helped for trouble shooting but i dont think it will be necessary so it was removed
+$outputCsvFile = Join-Path -Path $outputFolder -ChildPath ("SecondTierXALD_{0:MM-dd-yy}.csv" -f (Get-Date))
+
+if (Test-Path $outputCsvFile) {
+    Write-Host "File with the same name already exists in the output folder. Renaming the file..."
+    $newFileName = "{0}_{1:HHmmss}.csv" -f [System.IO.Path]::GetFileNameWithoutExtension($outputCsvFile), (Get-Date)
+    $outputCsvFile = Join-Path -Path $outputFolder -ChildPath $newFileName
+}
+
+#selected data exported to a CSV file in specifed output folder
+$selectedData | Export-Csv -Path $outputCsvFile -NoTypeInformation
+
+#Customizable message (not important)
+Write-Host "Second Tier XALD Sample List Generated."
+
+#Optional: prompt user to exit with any key
+Write-Host "Press any key to exit..."
+$null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+
+
+
+########################################################################################################################################################
+
+Windows Batch file code:
+
+@echo off
+set "scriptPath=%~dp0"
+powershell.exe -ExecutionPolicy Bypass -File "%scriptPath%Generate_XALD_list.ps1"
